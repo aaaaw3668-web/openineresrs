@@ -1,0 +1,209 @@
+import requests
+import time
+from datetime import datetime, date
+import urllib.parse
+
+# Настройки
+TELEGRAM_BOT_TOKEN = '7572230525:AAFzAQsMe4DlTYAA8G5UgGnYH598ZxgZOjs'
+TELEGRAM_CHAT_ID = '5296533274'
+OI_THRESHOLD = 10
+PRICE_THRESHOLD = 50
+TIME_WINDOW = 60 * 5
+MAX_ALERTS_PER_DAY = 10
+
+# Глобальные структуры данных
+historical_data = {}
+daily_alerts = {
+    'date': date.today(),
+    'counts': {}
+}
+
+
+def generate_links(symbol):
+    """Генерация ссылок на аналитические ресурсы"""
+    # Очищаем символ от возможных префиксов/суффиксов
+    clean_symbol = symbol.replace('USDT', '').replace('1000', '')
+
+    return {
+        'coinglass': f"https://www.coinglass.com/ru/pro/futures/LiquidationHeatMap{symbol}",
+        'tradingview': f"https://www.tradingview.com/chart/?symbol=BINANCE:{symbol}",
+        'dextools': f"https://www.dextools.io/app/en/ether/pair-explorer/{clean_symbol}",
+        'binance': f"https://www.binance.com/ru/trade/{symbol}",
+        'bybit': f"https://www.bybit.com/trade/usdt/{symbol}"
+    }
+
+
+
+def reset_daily_counters():
+    today = date.today()
+    if daily_alerts['date'] != today:
+        daily_alerts['date'] = today
+        daily_alerts['counts'] = {}
+        print("Счетчики уведомлений сброшены")
+
+
+def can_send_alert(symbol):
+    reset_daily_counters()
+    count = daily_alerts['counts'].get(symbol, 0)
+    if count >= MAX_ALERTS_PER_DAY:
+        return False
+    daily_alerts['counts'][symbol] = count + 1
+    return True
+
+
+def send_telegram_notification(message, symbol):
+    if not can_send_alert(symbol):
+        print(f"Лимит уведомлений достигнут для {symbol}")
+        return False
+
+    # Генерируем ссылки для символа
+    links = generate_links(symbol)
+
+    # Добавляем ссылки к сообщению
+    message_with_links = (
+        f"{message}\n\n"
+        f"🔗 <b>Быстрый анализ:</b>\n"
+        f"• 📊 <a href='{links['coinglass']}'>Coinglass</a>\n"
+        f"• 📈 <a href='{links['tradingview']}'>TradingView</a>\n"
+        f"• 💰 <a href='{links['binance']}'>Binance</a>\n"
+        f"• ⚡ <a href='{links['bybit']}'>Bybit</a>"
+    )
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        'chat_id': TELEGRAM_CHAT_ID,
+        'text': message_with_links,
+        'parse_mode': 'HTML',
+        'disable_web_page_preview': False
+    }
+    try:
+        print(f"Отправка для {symbol}: {message[:50]}...")
+        response = requests.post(url, json=payload)
+        response.raise_for_status()
+        return True
+    except Exception as e:
+        print(f"Ошибка отправки: {repr(e)}")
+        return False
+
+
+def calculate_change(old, new):
+    if old == 0:
+        return 0.0
+    return ((new - old) / old) * 100
+
+
+def fetch_perpetual_symbols():
+    url = "https://api.bybit.com/v5/market/instruments-info"
+    params = {"category": "linear"}
+    try:
+        response = requests.get(url, params=params)
+        if response.status_code == 200:
+            data = response.json()
+            if data['retCode'] == 0:
+                return [item['symbol'] for item in data['result']['list']]
+    except Exception as e:
+        print(f"Ошибка получения символов: {e}")
+    return []
+
+
+def fetch_bybit_ticker(symbol):
+    url = "https://api.bybit.com/v5/market/tickers"
+    params = {"category": "linear", "symbol": symbol}
+    try:
+        response = requests.get(url, params=params)
+        if response.status_code == 200:
+            data = response.json()
+            if data['retCode'] == 0:
+                return data['result']['list'][0]
+    except Exception as e:
+        print(f"Ошибка получения данных {symbol}: {e}")
+    return None
+
+
+def main():
+    print("Запуск мониторинга...")
+
+    symbols = fetch_perpetual_symbols()
+    if not symbols:
+        print("Не удалось получить список символов")
+        return
+
+    for symbol in symbols:
+        historical_data[symbol] = {'oi': [], 'price': []}
+
+    # Уведомление о запуске
+    requests.post(
+        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+        json={
+            'chat_id': TELEGRAM_CHAT_ID,
+            'text': "🔍 Бот начал работу с аналитическими ссылками!",
+            'parse_mode': 'HTML'
+        }
+    )
+
+    while True:
+        try:
+            reset_daily_counters()
+
+            for symbol in symbols:
+                ticker_data = fetch_bybit_ticker(symbol)
+                if not ticker_data:
+                    continue
+
+                current_oi = float(ticker_data['openInterest'])
+                current_price = float(ticker_data['lastPrice'])
+                timestamp = int(datetime.now().timestamp())
+
+                # Обновляем данные OI
+                historical_data[symbol]['oi'].append({'value': current_oi, 'timestamp': timestamp})
+                historical_data[symbol]['oi'] = [x for x in historical_data[symbol]['oi']
+                                                 if timestamp - x['timestamp'] <= TIME_WINDOW]
+
+                # Проверка OI
+                if len(historical_data[symbol]['oi']) > 1:
+                    old_oi = historical_data[symbol]['oi'][0]['value']
+                    oi_change = calculate_change(old_oi, current_oi)
+
+                    if oi_change >= OI_THRESHOLD:
+                        alert_count = daily_alerts['counts'].get(symbol, 0)
+                        remaining = MAX_ALERTS_PER_DAY - alert_count
+
+                        msg = (f"📈 <b>{symbol}</b>\n"
+                               f"Рост OI: +{oi_change:.2f}%\n"
+                               f"Было: {old_oi:.2f}\n"
+                               f"Стало: {current_oi:.2f}\n"
+                               f"Уведомлений: {alert_count}/{MAX_ALERTS_PER_DAY}")
+
+                        send_telegram_notification(msg, symbol)
+
+                # Проверка цены
+                historical_data[symbol]['price'].append({'value': current_price, 'timestamp': timestamp})
+                historical_data[symbol]['price'] = [x for x in historical_data[symbol]['price']
+                                                    if timestamp - x['timestamp'] <= TIME_WINDOW]
+
+                if len(historical_data[symbol]['price']) > 1:
+                    old_price = historical_data[symbol]['price'][0]['value']
+                    price_change = calculate_change(old_price, current_price)
+                    if abs(price_change) >= PRICE_THRESHOLD:
+                        alert_count = daily_alerts['counts'].get(symbol, 0)
+
+                        msg = (f"🚨 <b>{symbol}</b>\n"
+                               f"ΔЦена: {price_change:+.2f}%\n"
+                               f"Было: {old_price:.2f}\n"
+                               f"Стало: {current_price:.2f}\n"
+                               f"Уведомлений: {alert_count}/{MAX_ALERTS_PER_DAY}")
+
+                        send_telegram_notification(msg, symbol)
+
+            time.sleep(5)
+
+        except KeyboardInterrupt:
+            print("\nОстановка бота...")
+            break
+        except Exception as e:
+            print(f"Критическая ошибка: {repr(e)}")
+            time.sleep(10)
+
+
+if __name__ == "__main__":
+    main()
